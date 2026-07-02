@@ -1,0 +1,19 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# HFSS project files (large binaries — not needed in repo)
+*.aedt
+*.aedtresults/
+*.pyaedt
+*.log
+hfss_conn.json
+s11_result.csv
+ValidationReport/
+
+# IDE
+.vscode/
+.idea/

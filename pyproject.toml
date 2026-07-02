@@ -1,0 +1,24 @@
+[project]
+name = "ansys-hfss-mcp"
+version = "1.0.0"
+description = "MCP server that connects AI clients to ANSYS HFSS via PyAEDT"
+requires-python = ">=3.10"
+dependencies = [
+    "pyaedt>=0.6.0",
+    "mcp[cli]>=1.0.0",
+]
+
+[project.scripts]
+ansys-hfss-mcp = "hfss_mcp_server:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.backends.legacy:build"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["hfss_mcp_server*"]
+
+[tool.black]
+target-version = ["py310"]
+line-length = 100
