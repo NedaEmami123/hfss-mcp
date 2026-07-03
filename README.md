@@ -164,21 +164,25 @@ Long workflows run in the background. Claude will give you a `job_id` and poll a
 
 ---
 
-## Antenna Design Parameters (Patch — 2.4 GHz example)
+## Antenna Design Parameters (Patch — 2.4 GHz, mirrors HFSSDesign22)
 
-All parameters are created as **HFSS design variables** so you can parametrically sweep them:
+All parameters are created as **HFSS design variables**, and every geometry
+object is built from variable expressions (not baked floats), so the model
+is fully parametric — matching the "Type: Design" properties you'd see in
+the HFSS Properties panel — and you can sweep them:
 
 | Variable | Value | Description |
 |---|---|---|
-| `W` | 38.04 mm | Patch width (Pozar formula) |
-| `L` | 29.44 mm | Patch length (Pozar formula) |
-| `y0` | 5.59 mm | Coax feed offset |
-| `h_s` | 1.6 mm | FR4 substrate thickness |
-| `Ws` / `Ls` | 70 mm | Substrate & ground footprint |
-| `h_stub` | 3 mm | Coax stub depth below ground |
-| `r_probe` | 0.65 mm | Coax inner conductor radius |
-| `r_diel` | 2 mm | Coax dielectric outer radius |
-| `ab_lat` | 66 mm | Airbox half-width |
+| `patch_w` | 38 mm | Patch width (Pozar formula) |
+| `patch_l` | 29 mm | Patch length (Pozar formula) |
+| `feed_offset` | 9 mm | Coax feed inset from the radiating edge |
+| `sub_h` | 1.6 mm | FR4 substrate thickness |
+| `sub_w` / `sub_l` | 70 mm | Substrate & ground footprint |
+| `coax_drop` | 3 mm | Coax stub depth below ground |
+| `probe_rad` | 0.65 mm | Coax inner conductor radius / substrate clearance hole |
+| `antipad_rad` | 2 mm | Ground-plane anti-pad clearance (keeps probe from shorting to ground) |
+| `coax_outer_rad` | 2 mm | Coax dielectric outer radius |
+| `airbox_pad` | 31 mm | Airbox padding beyond the substrate edge |
 
 ---
 

@@ -539,7 +539,7 @@ def get_far_field(setup_name: str, sweep_name: str, sphere_name: str = "3D", fre
 # ---------------------------------------------------------------------------
 
 def _build_patch_antenna(job_id: str, freq_ghz: float, design_name: str, project: str, port: int) -> None:
-    """Coax-fed patch antenna — Modal Network, parametric variables, mirrors HFSSDesign2."""
+    """Coax-fed microstrip patch antenna — Modal Network, fully parametric, mirrors HFSSDesign22."""
     import math, traceback as _tb
     output_lines: list[str] = []
 
@@ -560,41 +560,26 @@ def _build_patch_antenna(job_id: str, freq_ghz: float, design_name: str, project
         oproject = _hfss._oproject
         proj_name = _hfss.project_name
 
-        # ── 1b. Create design via subprocess so gRPC SetActiveDesign works ──────
-        # When a *different* process creates the design, HFSS GUI activates it and
-        # our main process can then SetActiveDesign successfully. Same-process
-        # InsertDesign does not update the gRPC client's active-design context.
-        import subprocess, sys
+        try:
+            oproject.DeleteDesign(design_name)
+            log(f"Deleted pre-existing design '{design_name}'")
+        except Exception as e:
+            log(f"No pre-existing design to delete: {e}")
 
-        log(f"Phase 1 — creating design '{design_name}' via subprocess …")
-        helper = (
-            "from ansys.aedt.core import Hfss\n"
-            f"h = Hfss(project={repr(proj_name)}, machine='localhost', port={port}, close_on_exit=False)\n"
-            "try:\n"
-            f"    h._oproject.DeleteDesign({repr(design_name)})\n"
-            "    print('deleted')\n"
-            "except Exception as e:\n"
-            "    print('no delete:', e)\n"
-            f"h._oproject.InsertDesign('HFSS', {repr(design_name)}, 'HFSS Modal Network', '')\n"
-            f"print('done', h.project_name)\n"
-        )
-        result = subprocess.run(
-            [sys.executable, "-c", helper],
-            capture_output=True, text=True, timeout=120,
-        )
-        log(f"Subprocess stdout: {result.stdout.strip()}")
-        if result.stderr:
-            log(f"Subprocess stderr: {result.stderr.strip()[-300:]}")
-        if result.returncode != 0:
-            raise RuntimeError(f"Subprocess failed (rc={result.returncode})")
-        _time.sleep(3)
+        oproject.InsertDesign('HFSS', design_name, 'HFSS Modal Network', '')
+        oproject.SetActiveDesign(design_name)
+        log(f"Inserted and activated design '{design_name}'")
+        _time.sleep(2)  # let AEDT settle before a fresh client binds to it
 
-        # ── 2. Connect PyAEDT to the newly created design ────────────────────
+        # ── 2. Bind a fresh PyAEDT handle to the new design (same process) ────
+        # A same-process InsertDesign/SetActiveDesign followed by a *new* Hfss()
+        # object bound to the design name picks up the active design cleanly —
+        # no subprocess needed.
         log("Phase 2 — connecting PyAEDT to the new design …")
         h = Hfss(project=proj_name, design=design_name,
                  machine="localhost", port=port, close_on_exit=False)
         if h._odesign is None:
-            raise RuntimeError("PyAEDT _odesign is None after subprocess design creation.")
+            raise RuntimeError("PyAEDT _odesign is None after design creation.")
         sol = h._odesign.GetSolutionType()
         log(f"Connected: design='{h.design_name}'  solution type='{sol}'")
         if "Modal" not in sol:
@@ -606,7 +591,9 @@ def _build_patch_antenna(job_id: str, freq_ghz: float, design_name: str, project
             log(f"Clearing existing objects: {existing}")
             mod.delete(existing)
 
-        # ── 3. Compute antenna parameters (Pozar formulas, FR4 @ freq_ghz) ───
+        # ── 3. Patch dimensions (Pozar formulas, FR4 @ freq_ghz), rounded to
+        #      whole mm — reproduces HFSSDesign22's exact values at 2.4 GHz
+        #      (patch_w=38mm, patch_l=29mm, feed_offset=9mm) ───────────────────
         f_hz = freq_ghz * 1e9
         c, er, h_s = 3e8, 4.4, 1.6
 
@@ -614,144 +601,117 @@ def _build_patch_antenna(job_id: str, freq_ghz: float, design_name: str, project
         erc = (er+1)/2 + (er-1)/2 * (1+12*h_s/W)**-0.5
         dL  = 0.412*h_s*(erc+0.3)*(W/h_s+0.264) / ((erc-0.258)*(W/h_s+0.8))
         L   = (c / (2*f_hz*math.sqrt(erc))) * 1e3 - 2*dL
-        W, L    = round(W, 3), round(L, 3)
-        y0      = round(L / 5.27, 3)
-        Ws = Ls = 70.0
-        h_stub  = 3.0
-        ab_lat  = 66.0
-        air_above = 31.0
-        r_probe = 0.65
-        r_diel  = 2.0
-        airbox_h = round(h_stub + h_s + air_above, 3)
+        y0  = L / 5.27
 
-        log(f"Parameters: W={W}mm  L={L}mm  y0={y0}mm  h_s={h_s}mm  airbox_h={airbox_h}mm")
+        patch_w     = round(W)
+        patch_l     = round(L)
+        feed_offset = round(patch_l/2 - y0)
 
-        # ── 4. Create HFSS design variables (same as HFSSDesign2) ────────────
+        # Fixed structural constants — same values as HFSSDesign22
+        sub_h_v          = 1.6
+        sub_w_v          = 70.0
+        sub_l_v          = 70.0
+        probe_rad_v      = 0.65
+        airbox_pad_v     = 31.0
+        coax_drop_v      = 3.0
+        antipad_rad_v    = 2.0
+        coax_outer_rad_v = 2.0
+
+        log(f"Parameters: patch_w={patch_w}mm  patch_l={patch_l}mm  feed_offset={feed_offset}mm  sub_h={sub_h_v}mm")
+
+        # ── 4. Create HFSS design variables (same names/values as HFSSDesign22) ─
         log("Creating design variables …")
-        h["W"]         = f"{W}mm"
-        h["L"]         = f"{L}mm"
-        h["y0"]        = f"{y0}mm"
-        h["h_s"]       = f"{h_s}mm"
-        h["Ws"]        = f"{Ws}mm"
-        h["Ls"]        = f"{Ls}mm"
-        h["h_stub"]    = f"{h_stub}mm"
-        h["ab_lat"]    = f"{ab_lat}mm"
-        h["air_above"] = f"{air_above}mm"
-        h["airbox_h"]  = f"{airbox_h}mm"
-        h["r_probe"]   = f"{r_probe}mm"
-        h["r_diel"]    = f"{r_diel}mm"
-        log("Variables: W, L, y0, h_s, Ws, Ls, h_stub, ab_lat, air_above, airbox_h, r_probe, r_diel")
+        h["sub_h"]          = f"{sub_h_v}mm"
+        h["patch_w"]        = f"{patch_w}mm"
+        h["patch_l"]        = f"{patch_l}mm"
+        h["sub_w"]          = f"{sub_w_v}mm"
+        h["sub_l"]          = f"{sub_l_v}mm"
+        h["feed_offset"]    = f"{feed_offset}mm"
+        h["probe_rad"]      = f"{probe_rad_v}mm"
+        h["airbox_pad"]     = f"{airbox_pad_v}mm"
+        h["coax_drop"]      = f"{coax_drop_v}mm"
+        h["antipad_rad"]    = f"{antipad_rad_v}mm"
+        h["coax_outer_rad"] = f"{coax_outer_rad_v}mm"
+        log("Variables: sub_h, patch_w, patch_l, sub_w, sub_l, feed_offset, probe_rad, airbox_pad, coax_drop, antipad_rad, coax_outer_rad")
 
-        # ── 5. Geometry — float values used directly for reliability ──────────
-        # FR4 substrate slab: z = 0 to h_s
+        # ── 5. Geometry — fully parametric (linked to the variables above),
+        #      mirrors HFSSDesign22 object-for-object ─────────────────────────
+        feed_y = "-patch_l/2 + feed_offset"   # feed inset from the radiating edge
+
+        # FR4 substrate slab: z = 0 to sub_h
         mod.create_box(
-            [-Ws/2, -Ls/2, 0],
-            [Ws, Ls, h_s],
-            name="Substrate", material="FR4_epoxy",
+            ["-sub_w/2", "-sub_l/2", "0mm"],
+            ["sub_w", "sub_l", "sub_h"],
+            name="Substrate", material="fr4_epoxy",
         )
         log("Substrate OK")
 
-        # Vacuum airbox: z = -h_stub to h_s+air_above
+        # Vacuum airbox: z = -coax_drop to sub_h+airbox_pad
         mod.create_box(
-            [-ab_lat, -ab_lat, -h_stub],
-            [2*ab_lat, 2*ab_lat, airbox_h],
+            ["-(sub_w/2+airbox_pad)", "-(sub_l/2+airbox_pad)", "-coax_drop"],
+            ["sub_w+2*airbox_pad", "sub_l+2*airbox_pad", "coax_drop+sub_h+airbox_pad"],
             name="Airbox", material="vacuum",
         )
         log("Airbox OK")
 
-        # Ground plane — horizontal sheet at z=0 in XY plane (WhichAxis=Z via COM)
-        oeditor = mod.oeditor
-        oeditor.CreateRectangle([
-            "NAME:RectangleParameters",
-            "IsCovered:=", True,
-            "XStart:=", f"{-Ws/2}mm",
-            "YStart:=", f"{-Ls/2}mm",
-            "ZStart:=", "0mm",
-            "Width:=", f"{Ws}mm",
-            "Height:=", f"{Ls}mm",
-            "WhichAxis:=", "Z",
-        ], [
-            "NAME:Attributes",
-            "Name:=", "Ground",
-            "Flags:=", "",
-            "Color:=", "(143 175 143)",
-            "Transparency:=", 0,
-            "PartCoordinateSystem:=", "Global",
-            "UDMId:=", "",
-            "MaterialValue:=", '"vacuum"',
-            "SolveInside:=", False,
-        ])
+        # Ground plane — horizontal sheet at z=0 in XY plane
+        mod.create_rectangle(
+            orientation="XY",
+            origin=["-sub_w/2", "-sub_l/2", "0mm"],
+            sizes=["sub_w", "sub_l"],
+            is_covered=True,
+            name="Ground",
+            material="vacuum",
+        )
         log("Ground OK")
 
-        # Radiating patch — horizontal sheet at z=h_s in XY plane (WhichAxis=Z via COM)
-        oeditor.CreateRectangle([
-            "NAME:RectangleParameters",
-            "IsCovered:=", True,
-            "XStart:=", f"{-W/2}mm",
-            "YStart:=", f"{-L/2}mm",
-            "ZStart:=", f"{h_s}mm",
-            "Width:=", f"{W}mm",
-            "Height:=", f"{L}mm",
-            "WhichAxis:=", "Z",
-        ], [
-            "NAME:Attributes",
-            "Name:=", "Patch",
-            "Flags:=", "",
-            "Color:=", "(255 128 65)",
-            "Transparency:=", 0,
-            "PartCoordinateSystem:=", "Global",
-            "UDMId:=", "",
-            "MaterialValue:=", '"vacuum"',
-            "SolveInside:=", False,
-        ])
+        # Radiating patch — horizontal sheet at z=sub_h in XY plane
+        mod.create_rectangle(
+            orientation="XY",
+            origin=["-patch_w/2", "-patch_l/2", "sub_h"],
+            sizes=["patch_w", "patch_l"],
+            is_covered=True,
+            name="Patch",
+            material="vacuum",
+        )
         log("Patch OK")
 
-        # Coax probe — copper cylinder from z=-h_stub through substrate to z=h_s
-        mod.create_cylinder(2, [0, -y0, -h_stub], r_probe, h_stub + h_s,
+        # Coax probe — copper cylinder from z=-coax_drop through substrate to z=sub_h
+        mod.create_cylinder(2, ["0mm", feed_y, "-coax_drop"], "probe_rad", "sub_h + coax_drop",
                             name="Probe", material="copper")
         log("Probe OK")
 
-        # Coax dielectric — Teflon cylinder below ground: z=-h_stub to z=0
-        mod.create_cylinder(2, [0, -y0, -h_stub], r_diel, h_stub,
-                            name="CoaxDielectric", material="Teflon (tm)")
+        # Coax dielectric — Teflon cylinder below ground: z=-coax_drop to z=0
+        mod.create_cylinder(2, ["0mm", feed_y, "-coax_drop"], "coax_outer_rad", "coax_drop",
+                            name="CoaxDielectric", material="teflon (tm)")
         log("CoaxDielectric OK")
 
         # Hollow out CoaxDielectric around probe (keep probe)
         mod.subtract("CoaxDielectric", ["Probe"], keep_originals=True)
         log("CoaxDielectric annularised OK")
 
-        # Clearance hole through substrate for probe
-        _sh = mod.create_cylinder(2, [0, -y0, 0], r_probe, h_s, name="_sub_hole")
+        # Clearance hole through substrate for probe (tight fit, probe_rad)
+        _sh = mod.create_cylinder(2, ["0mm", feed_y, "0mm"], "probe_rad", "sub_h", name="_sub_hole")
         mod.subtract("Substrate", ["_sub_hole"], keep_originals=False)
         log("Substrate clearance hole OK")
 
-        # Clearance hole in ground sheet for probe — horizontal circle via COM
-        oeditor.CreateCircle([
-            "NAME:CircleParameters",
-            "IsCovered:=", True,
-            "XCenter:=", "0mm",
-            "YCenter:=", f"{-y0}mm",
-            "ZCenter:=", "0mm",
-            "Radius:=", f"{r_probe}mm",
-            "WhichAxis:=", "Z",
-            "NumSegments:=", "0",
-        ], [
-            "NAME:Attributes",
-            "Name:=", "_gnd_hole",
-            "Flags:=", "",
-            "Color:=", "(143 175 143)",
-            "Transparency:=", 0,
-            "PartCoordinateSystem:=", "Global",
-            "UDMId:=", "",
-            "MaterialValue:=", '"vacuum"',
-            "SolveInside:=", False,
-        ])
+        # Anti-pad clearance in the ground plane — antipad_rad (larger than
+        # probe_rad) so the probe doesn't short to ground; matches HFSSDesign22.
+        mod.create_circle(
+            orientation="XY",
+            origin=["0mm", feed_y, "0mm"],
+            radius="antipad_rad",
+            num_sides=0,
+            is_covered=True,
+            name="_gnd_hole",
+            material="vacuum",
+        )
         mod.subtract("Ground", ["_gnd_hole"], keep_originals=False)
-        log("Ground clearance hole OK")
+        log("Ground anti-pad clearance OK")
 
         log(f"All objects: {mod.object_names}")
 
-        # ── 4. Boundaries ─────────────────────────────────────────────────────
+        # ── 6. Boundaries ─────────────────────────────────────────────────────
         h.assign_perfecte_to_sheets("Ground", name="PerfE_Ground")
         log("PerfE_Ground OK")
 
@@ -767,10 +727,11 @@ def _build_patch_antenna(job_id: str, freq_ghz: float, design_name: str, project
         h.assign_radiation_boundary_to_objects("Airbox", name="Rad_Airbox")
         log("Rad_Airbox OK")
 
-        # ── 5. Wave port WITH integration line via direct COM call ────────────
-        # Integration line: from probe edge (r_probe) to outer conductor edge (r_diel)
-        # Both points at z=-h_stub (port face), y=-y0 (feed axis)
+        # ── 7. Wave port WITH integration line via direct COM call ────────────
+        # Integration line: from probe edge (probe_rad) to outer conductor edge
+        # (coax_outer_rad). Both points at z=-coax_drop (port face), y=feed_y (feed axis)
         # Using "Start/End" mm-string format — HFSS scripting recorder format
+        feed_y_v = feed_offset - patch_l/2
         bot_face = min(cdiel_obj.faces, key=lambda f: f.center[2])
         log(f"Wave port face: id={bot_face.id}  z={bot_face.center[2]:.2f}  area={bot_face.area:.2f}")
 
@@ -791,8 +752,8 @@ def _build_patch_antenna(job_id: str, freq_ghz: float, design_name: str, project
                 "UseIntLine:=", True,
                 "IntLine:=", [
                     "NAME:IntLine",
-                    "Start:=", [f"{r_probe}mm", f"{-y0}mm", f"{-h_stub}mm"],
-                    "End:=",   [f"{r_diel}mm",  f"{-y0}mm", f"{-h_stub}mm"],
+                    "Start:=", [f"{probe_rad_v}mm", f"{feed_y_v}mm", f"{-coax_drop_v}mm"],
+                    "End:=",   [f"{coax_outer_rad_v}mm", f"{feed_y_v}mm", f"{-coax_drop_v}mm"],
                 ],
                 "AlignmentGroup:=", 0,
                 "CharImp:=", "Zpi",
@@ -809,7 +770,7 @@ def _build_patch_antenna(job_id: str, freq_ghz: float, design_name: str, project
         if not any("WavePort_Coax" in e for e in all_excitations):
             raise RuntimeError(f"WavePort_Coax not found in excitations: {all_excitations}")
 
-        # ── 6. Solution setup ─────────────────────────────────────────────────
+        # ── 8. Solution setup ─────────────────────────────────────────────────
         setup = h.create_setup(name="Setup1")
         setup.props["Frequency"] = f"{freq_ghz}GHz"
         setup.props["MaximumPasses"] = 20
@@ -817,7 +778,7 @@ def _build_patch_antenna(job_id: str, freq_ghz: float, design_name: str, project
         setup.update()
         log("Setup1 OK")
 
-        # ── 7. Sweeps — matches HFSSDesign2 exactly ──────────────────────────
+        # ── 9. Sweeps — matches HFSSDesign22 exactly ──────────────────────────
         # Sweep1: interpolating, 1.5-3.5 GHz, 401 points, SaveFields=True (for S11)
         h.create_linear_count_sweep(
             "Setup1", "GHz", 1.5, 3.5, 401,
@@ -836,7 +797,7 @@ def _build_patch_antenna(job_id: str, freq_ghz: float, design_name: str, project
             sweep2.update()
         log("Sweep_Rad (0.05GHz step, SaveRadFields) OK")
 
-        # ── 8. Far-field infinite sphere BEFORE solve ─────────────────────────
+        # ── 10. Far-field infinite sphere BEFORE solve ────────────────────────
         h.insert_infinite_sphere(
             phi_start=0, phi_stop=360, phi_step=2,
             theta_start=0, theta_stop=180, theta_step=2,
@@ -844,16 +805,16 @@ def _build_patch_antenna(job_id: str, freq_ghz: float, design_name: str, project
         )
         log("Infinite sphere '3D' inserted (Phi 0-360°, Theta 0-180°, 2° step)")
 
-        # ── 9. Save ───────────────────────────────────────────────────────────
+        # ── 11. Save ──────────────────────────────────────────────────────────
         h.save_project()
         log("Project saved.")
 
-        # ── 10. Solve ─────────────────────────────────────────────────────────
+        # ── 12. Solve ─────────────────────────────────────────────────────────
         log("Solving … (several minutes)")
         h.analyze_setup("Setup1")
         log("Solve complete.")
 
-        # ── 11. Reports ───────────────────────────────────────────────────────
+        # ── 13. Reports ───────────────────────────────────────────────────────
         # For Modal solution type, S-param port name format is "WavePort_Coax:1"
         # Use GetExcitations; fall back to hardcoded name if empty (timing issue)
         excitations = list(obound.GetExcitations())
@@ -906,8 +867,8 @@ def _build_patch_antenna(job_id: str, freq_ghz: float, design_name: str, project
                 setup_sweep_name="Setup1 : LastAdaptive",
                 report_category="Far Fields",
                 plot_type="3D Polar Plot",
-                primary_sweep_variable="Theta",
-                secondary_sweep_variable="Phi",
+                primary_sweep_variable="Phi",
+                secondary_sweep_variable="Theta",
                 context="3D",
                 plot_name="RadiationPattern_3D",
                 show=False,
@@ -929,11 +890,19 @@ def _build_patch_antenna(job_id: str, freq_ghz: float, design_name: str, project
 @mcp.tool()
 def design_patch_antenna(
     freq_ghz: float = 2.4,
-    design_name: str = "HFSSDesign2",
+    design_name: str = "PatchAntenna_2p4GHz",
     project: str = "",
     port: int = 50051,
 ) -> str:
     """Design a complete coax-fed microstrip patch antenna from scratch.
+
+    Reproduces HFSSDesign22 object-for-object at the default 2.4 GHz: same
+    design-variable names (sub_h, patch_w, patch_l, sub_w, sub_l, feed_offset,
+    probe_rad, airbox_pad, coax_drop, antipad_rad, coax_outer_rad), same fully
+    parametric geometry (every object position/size is a variable expression,
+    not a baked float — visible as "Type: Design" in the Properties panel),
+    and the ground-plane anti-pad clearance (antipad_rad, separate from the
+    tighter probe_rad hole in the substrate) that avoids shorting the probe.
 
     Triggered by requests like:
       "design a 2.4 GHz patch antenna — geometry, materials, solution, solve,
@@ -941,19 +910,19 @@ def design_patch_antenna(
 
     Workflow (runs in background — poll with get_script_result):
       1. Create a NEW HFSS Modal design named <design_name>
-      2. Compute patch dimensions (Pozar formulas) for <freq_ghz> on FR4
+      2. Compute patch_w, patch_l, feed_offset (Pozar formulas) for <freq_ghz> on FR4
       3. Build geometry: Substrate, Airbox, Ground, Patch, Probe, CoaxDielectric
-      4. Assign materials: FR4_epoxy, copper, Teflon
+      4. Assign materials: fr4_epoxy, copper, teflon (tm)
       5. Assign boundaries: PerfE_Ground, PerfE_Patch, PerfE_CoaxShield, Rad_Airbox
       6. Add wave port (WavePort_Coax) at bottom of coax stub
       7. Create Setup1 (adaptive at freq_ghz, 20 passes, ΔS=0.02)
-      8. Add Sweep1 (1.5–3.5 GHz interpolating)
-      9. Solve
+      8. Add Sweep1 (1.5–3.5 GHz interpolating) + Sweep_Rad (far-field)
+      9. Insert infinite sphere '3D', save, solve
      10. Create reports: S11 return loss, E-plane, H-plane, 3D gain
 
     Args:
-        freq_ghz: Design frequency in GHz (default 2.4).
-        design_name: HFSS design name to create (default "PatchAntenna").
+        freq_ghz: Design frequency in GHz (default 2.4 — reproduces HFSSDesign22 exactly).
+        design_name: HFSS design name to create (default "PatchAntenna_2p4GHz").
         project: Project name (empty = active project).
         port: gRPC port AEDT is listening on (default 50051).
     """
@@ -1003,41 +972,27 @@ def _build_dipole_antenna(job_id: str, freq_ghz: float, design_name: str, projec
         import time as _time
 
         # ── 1. Create Terminal design using the existing _hfss connection ─────
-        # Avoids spawning a subprocess (which would block on the same gRPC port).
         log(f"Phase 1 — creating design '{design_name}' (Terminal Network) …")
         oproject = _hfss._oproject
         proj_name = _hfss.project_name
 
-        import subprocess, sys
+        try:
+            oproject.DeleteDesign(design_name)
+            log(f"Deleted pre-existing design '{design_name}'")
+        except Exception as e:
+            log(f"No pre-existing design to delete: {e}")
 
-        log(f"Phase 1 — creating Terminal design '{design_name}' via subprocess …")
-        helper = (
-            "from ansys.aedt.core import Hfss\n"
-            f"h = Hfss(project={repr(proj_name)}, machine='localhost', port={port}, close_on_exit=False)\n"
-            "try:\n"
-            f"    h._oproject.DeleteDesign({repr(design_name)})\n"
-            "    print('deleted')\n"
-            "except Exception as e:\n"
-            "    print('no delete:', e)\n"
-            f"h._oproject.InsertDesign('HFSS', {repr(design_name)}, 'HFSS Terminal Network', '')\n"
-            f"print('done', h.project_name)\n"
-        )
-        result = subprocess.run(
-            [sys.executable, "-c", helper],
-            capture_output=True, text=True, timeout=120,
-        )
-        log(f"Subprocess stdout: {result.stdout.strip()}")
-        if result.stderr:
-            log(f"Subprocess stderr: {result.stderr.strip()[-300:]}")
-        if result.returncode != 0:
-            raise RuntimeError(f"Subprocess failed (rc={result.returncode})")
-        _time.sleep(3)
+        oproject.InsertDesign('HFSS', design_name, 'HFSS Terminal Network', '')
+        oproject.SetActiveDesign(design_name)
+        log(f"Inserted and activated design '{design_name}'")
+        _time.sleep(2)  # let AEDT settle before a fresh client binds to it
 
+        # ── 2. Bind a fresh PyAEDT handle to the new design (same process) ────
         log("Phase 2 — connecting PyAEDT to the new design …")
         h = Hfss(project=proj_name, design=design_name,
                  machine="localhost", port=port, close_on_exit=False)
         if h._odesign is None:
-            raise RuntimeError("PyAEDT _odesign is None after subprocess design creation.")
+            raise RuntimeError("PyAEDT _odesign is None after design creation.")
         sol = h._odesign.GetSolutionType()
         log(f"Connected: design='{h.design_name}'  solution type='{sol}'")
         if "Terminal" not in sol:
@@ -1222,8 +1177,8 @@ def _build_dipole_antenna(job_id: str, freq_ghz: float, design_name: str, projec
                 setup_sweep_name="Setup1 : LastAdaptive",
                 report_category="Far Fields",
                 plot_type="3D Polar Plot",
-                primary_sweep_variable="Theta",
-                secondary_sweep_variable="Phi",
+                primary_sweep_variable="Phi",
+                secondary_sweep_variable="Theta",
                 context="3D",
                 plot_name="RadiationPattern_3D",
                 show=False,
